@@ -1,0 +1,368 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AdOps QA Assistant</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif; background: #f7f8fc; color: #1a1a2e; }
+  input, select { font-family: inherit; outline: none; }
+  input:focus, select:focus { border-color: #4fc3f7 !important; }
+  button { font-family: inherit; cursor: pointer; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
+  .fade-in { animation: fadeIn 0.3s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .diff-del { background: #fff0b3; color: #7d5a00; border-radius: 2px; padding: 1px 4px; font-weight: 700; border-bottom: 2px solid #f0b400; }
+  .diff-ins { background: #ffe0b2; color: #bf360c; border-radius: 2px; padding: 1px 2px; font-weight: 600; }
+  .diff-match { color: inherit; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+const { useState, useCallback, useRef, createElement: h } = React;
+
+const DEMO_DATA = {
+  "Campaign Name": "Spring Sale Campaign",
+  "Deal ID": "201235",
+  "Flight Start Date": "03/02/2025",
+  "Flight End Date": "03/18/2025",
+  "Budget": "$100",
+  "IO Signed": "Yes",
+  "Wallet Cap": "Nil",
+  "Targeting": "US, 25-45, Interests: Fashion",
+  "Creative Format": "Display 300x250",
+  "Alt Tag": "Spring Sale – Up to 50% Off | Shop Now",
+  "Keywords": "spring sale, fashion deals, discount clothing, seasonal offer",
+};
+
+const QA_FIELDS = [
+  { key: "Campaign Name", label: "Campaign Name", type: "text" },
+  { key: "Deal ID", label: "Deal ID", type: "text" },
+  { key: "Flight Start Date", label: "Flight Start Date", type: "text", placeholder: "MM/DD/YYYY" },
+  { key: "Flight End Date", label: "Flight End Date", type: "text", placeholder: "MM/DD/YYYY" },
+  { key: "Budget", label: "Budget", type: "text", placeholder: "$0" },
+  { key: "IO Signed", label: "IO Signed", type: "select", options: ["", "Yes", "No", "Pending"] },
+  { key: "Wallet Cap", label: "Wallet Cap", type: "text" },
+  { key: "Targeting", label: "Targeting", type: "text" },
+  { key: "Creative Format", label: "Creative Format", type: "text" },
+  { key: "Alt Tag", label: "Alt Tag", type: "text", placeholder: "Descriptive alt text for creative" },
+  { key: "Keywords", label: "Keywords", type: "text", placeholder: "keyword1, keyword2, keyword3" },
+];
+
+const norm = v => (v ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
+const compare = (exp, act) => !act ? "pending" : norm(exp) === norm(act) ? "pass" : "fail";
+
+const SC = {
+  pass:    { label: "PASS",    bg: "#e8f5e9", color: "#2e7d32", border: "#a5d6a7", dot: "#43a047" },
+  fail:    { label: "FAIL",    bg: "#ffebee", color: "#c62828", border: "#ef9a9a", dot: "#e53935" },
+  review:  { label: "REVIEW",  bg: "#fff8e1", color: "#e65100", border: "#ffe082", dot: "#ffa000" },
+  pending: { label: "PENDING", bg: "#f5f5f5", color: "#757575", border: "#e0e0e0", dot: "#9e9e9e" },
+};
+
+// Diff engine: LCS on tokens
+function tokenise(str) {
+  return str.match(/\d+|[a-zA-Z]+|[^a-zA-Z\d\s]|\s+/g) || [];
+}
+function computeDiff(expected, actual) {
+  const a = tokenise(expected), b = tokenise(actual);
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m+1 }, () => new Int32Array(n+1));
+  for (let i=1;i<=m;i++) for (let j=1;j<=n;j++)
+    dp[i][j] = a[i-1]===b[j-1] ? dp[i-1][j-1]+1 : Math.max(dp[i-1][j],dp[i][j-1]);
+  const out = [];
+  let i=m, j=n;
+  while (i>0||j>0) {
+    if (i>0&&j>0&&a[i-1]===b[j-1]) { out.unshift({text:a[i-1],type:"match"}); i--;j--; }
+    else if (j>0&&(i===0||dp[i][j-1]>=dp[i-1][j])) { out.unshift({text:b[j-1],type:"ins"}); j--; }
+    else { out.unshift({text:a[i-1],type:"del"}); i--; }
+  }
+  // collapse consecutive same-type tokens
+  return out.reduce((acc,tok) => {
+    const last=acc[acc.length-1];
+    if (last&&last.type===tok.type) { last.text+=tok.text; return acc; }
+    return [...acc,{...tok}];
+  },[]);
+}
+
+function DiffExpected({ diff }) {
+  return h("span", null, ...diff.map((tok,i) =>
+    tok.type==="match" ? h("span",{key:i,className:"diff-match"},tok.text)
+    : tok.type==="del" ? h("span",{key:i,className:"diff-del",title:"In brief but missing/changed in platform"},tok.text)
+    : null
+  ));
+}
+function DiffActual({ diff }) {
+  return h("span", null, ...diff.map((tok,i) =>
+    tok.type==="match" ? h("span",{key:i,className:"diff-match"},tok.text)
+    : tok.type==="ins" ? h("span",{key:i,className:"diff-ins",title:"Entered in platform but not in brief"},tok.text)
+    : null
+  ));
+}
+function DiffLegend() {
+  return h("div",{style:{display:"flex",alignItems:"center",gap:12,padding:"7px 14px",background:"#fff8f0",border:"1px solid #ffe0b2",borderRadius:6,fontSize:11,flexWrap:"wrap"}},
+    h("span",{style:{color:"#888",fontWeight:700,letterSpacing:"0.05em",textTransform:"uppercase"}},"Diff key:"),
+    h("span",{style:{display:"flex",alignItems:"center",gap:5}},
+      h("span",{className:"diff-del"},"abc"),
+      h("span",{style:{color:"#666"}}," — in brief, missing in platform")
+    ),
+    h("span",{style:{color:"#ddd"}},"·"),
+    h("span",{style:{display:"flex",alignItems:"center",gap:5}},
+      h("span",{className:"diff-ins"},"abc"),
+      h("span",{style:{color:"#666"}}," — entered in platform, not in brief")
+    )
+  );
+}
+
+function StepIndicator({ number, label, active, done }) {
+  return h("div", { style: { display:"flex", alignItems:"center", gap:8 } },
+    h("div", { style: {
+      width:28, height:28, borderRadius:"50%", display:"flex", alignItems:"center",
+      justifyContent:"center", fontSize:12, fontWeight:600, fontFamily:"monospace",
+      background: done?"#1a1a2e":active?"#16213e":"#e8e8e8",
+      color: done||active?"#fff":"#999",
+      border: active?"2px solid #4fc3f7":"2px solid transparent",
+    }}, done?"✓":number),
+    h("span", { style: { fontSize:13, fontWeight:active?600:400, color:active?"#1a1a2e":"#888" } }, label)
+  );
+}
+
+function App() {
+  const [step, setStep] = useState(1);
+  const [briefData, setBriefData] = useState(null);
+  const [formValues, setFormValues] = useState({});
+  const [qaResults, setQaResults] = useState({});
+  const [manualStatus, setManualStatus] = useState({});
+  const [comments, setComments] = useState({});
+  const [qaRun, setQaRun] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [fileName, setFileName] = useState("");
+  const [diffMap, setDiffMap] = useState({});
+  const fileRef = useRef();
+
+  const parseExcel = useCallback((file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const data = new Uint8Array(e.target.result);
+      const wb = XLSX.read(data, { type: "array" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+      const extracted = {};
+      rows.forEach(row => { if (row.length>=2&&row[0]) extracted[row[0].toString().trim()]=(row[1]??"").toString().trim(); });
+      if (!Object.keys(extracted).length) { const json=XLSX.utils.sheet_to_json(ws,{defval:""}); if (json.length) Object.assign(extracted,json[0]); }
+      setBriefData(Object.keys(extracted).length?extracted:DEMO_DATA); setStep(2);
+    };
+    reader.readAsArrayBuffer(file);
+  }, []);
+
+  const handleFile = (file) => { if (!file) return; setFileName(file.name); parseExcel(file); };
+
+  const runQA = () => {
+    const results={}, diffs={};
+    QA_FIELDS.forEach(({key}) => {
+      const exp=briefData?.[key]??"", act=formValues[key]??"";
+      results[key]=manualStatus[key]||compare(exp,act);
+      if (results[key]==="fail") diffs[key]=computeDiff(exp,act);
+    });
+    setQaResults(results); setDiffMap(diffs); setQaRun(true); setStep(3);
+  };
+
+  const toggleStatus = (key) => {
+    const cycle=["pass","fail","review"];
+    const next=cycle[(cycle.indexOf(qaResults[key]||"pass")+1)%3];
+    setQaResults(p=>({...p,[key]:next})); setManualStatus(p=>({...p,[key]:next}));
+    if (next==="fail") { const exp=briefData?.[key]??"",act=formValues[key]??""; setDiffMap(p=>({...p,[key]:computeDiff(exp,act)})); }
+  };
+
+  const vals=Object.values(qaResults);
+  const passCount=vals.filter(s=>s==="pass").length, failCount=vals.filter(s=>s==="fail").length, reviewCount=vals.filter(s=>s==="review").length;
+  const total=QA_FIELDS.length, score=total?Math.round((passCount/total)*100):0;
+  const scoreColor=score>=80?"#43a047":score>=50?"#ffa000":"#e53935";
+
+  const exportReport = () => {
+    const lines=["AdOps Campaign QA Report",`Brief: ${fileName}`,`Date: ${new Date().toLocaleDateString()}`,`Score: ${score}% (${passCount}/${total} passed)`,"",
+      ...QA_FIELDS.map(({key,label})=>`[${(qaResults[key]||"pending").toUpperCase()}] ${label}: Expected="${briefData?.[key]||""}" Actual="${formValues[key]||""}"${comments[key]?` | Note: ${comments[key]}`:""}`)
+    ].join("\n");
+    const url=URL.createObjectURL(new Blob([lines],{type:"text/plain"}));
+    const a=document.createElement("a"); a.href=url; a.download="qa_report.txt"; a.click(); URL.revokeObjectURL(url);
+  };
+
+  const reset = () => { setStep(1); setBriefData(null); setFormValues({}); setQaResults({}); setManualStatus({}); setComments({}); setDiffMap({}); setQaRun(false); };
+
+  return h("div", { style: { minHeight:"100vh", background:"#f7f8fc", color:"#1a1a2e", fontFamily:"'IBM Plex Sans','Segoe UI',sans-serif" } },
+
+    h("div", { style: { background:"#1a1a2e", color:"#fff", padding:"14px 28px", display:"flex", alignItems:"center", justifyContent:"space-between", borderBottom:"2px solid #4fc3f7", flexWrap:"wrap", gap:12 } },
+      h("div", { style: { display:"flex", alignItems:"center", gap:12 } },
+        h("div", { style: { width:36, height:36, background:"#4fc3f7", borderRadius:4, display:"flex", alignItems:"center", justifyContent:"center", fontWeight:700, fontSize:14, color:"#1a1a2e", fontFamily:"monospace" } }, "QA"),
+        h("div", null,
+          h("div", { style: { fontWeight:600, fontSize:15, letterSpacing:"0.02em" } }, "AdOps QA Assistant"),
+          h("div", { style: { fontSize:10, color:"#90caf9", letterSpacing:"0.08em", textTransform:"uppercase" } }, "Campaign Brief Verification Tool")
+        )
+      ),
+      h("div", { style: { display:"flex", alignItems:"center", gap:16, flexWrap:"wrap" } },
+        h(StepIndicator, { number:1, label:"Upload Brief", active:step===1, done:step>1 }),
+        h("div", { style: { width:24, height:1, background:"#444" } }),
+        h(StepIndicator, { number:2, label:"Platform Data", active:step===2, done:step>2 }),
+        h("div", { style: { width:24, height:1, background:"#444" } }),
+        h(StepIndicator, { number:3, label:"QA Results", active:step===3, done:false })
+      )
+    ),
+
+    h("div", { style: { maxWidth:1100, margin:"0 auto", padding:"28px 20px" } },
+
+      // STEP 1
+      step===1 && h("div", { className:"fade-in", style: { display:"flex", flexDirection:"column", alignItems:"center", gap:22 } },
+        h("div", { style: { textAlign:"center" } },
+          h("h1", { style: { fontSize:26, fontWeight:600, margin:"0 0 6px", letterSpacing:"-0.01em" } }, "Upload Campaign Brief"),
+          h("p", { style: { color:"#666", margin:0, fontSize:14 } }, "Upload the Excel brief from your sales or planning team")
+        ),
+        h("div", {
+          onDragOver: e=>{e.preventDefault();setDragging(true);}, onDragLeave:()=>setDragging(false),
+          onDrop: e=>{e.preventDefault();setDragging(false);handleFile(e.dataTransfer.files[0]);},
+          onClick: ()=>fileRef.current.click(),
+          style: { width:"100%", maxWidth:500, border:`2px dashed ${dragging?"#4fc3f7":"#c5cae9"}`, borderRadius:12, padding:"44px 28px", textAlign:"center", cursor:"pointer", background:dragging?"#e8f4fd":"#fff", transition:"all 0.2s" }
+        },
+          h("input", { ref:fileRef, type:"file", accept:".xlsx,.xls", style:{display:"none"}, onChange:e=>handleFile(e.target.files[0]) }),
+          h("div", { style: { fontSize:38, marginBottom:10 } }, "📊"),
+          h("div", { style: { fontWeight:600, fontSize:15, marginBottom:6 } }, "Drop Excel brief here"),
+          h("div", { style: { color:"#999", fontSize:13 } }, "or click to browse — .xlsx, .xls accepted")
+        ),
+        h("div", { style: { color:"#bbb", fontSize:12 } }, "— or —"),
+        h("button", { onClick:()=>{setBriefData(DEMO_DATA);setFileName("demo_brief.xlsx");setStep(2);}, style:{padding:"10px 28px",borderRadius:8,border:"1.5px solid #1a1a2e",background:"#fff",fontWeight:600,fontSize:13,letterSpacing:"0.03em",color:"#1a1a2e"} }, "Use Demo Data"),
+        h("div", { style: { background:"#fff", border:"1px solid #e0e0e0", borderRadius:10, padding:"18px 22px", width:"100%", maxWidth:500 } },
+          h("div", { style: { fontSize:11, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"#aaa", marginBottom:12 } }, "Expected Excel Fields"),
+          h("div", { style: { display:"grid", gridTemplateColumns:"1fr 1fr", gap:"6px 20px" } },
+            ...QA_FIELDS.map(f=>h("div",{key:f.key,style:{fontSize:13,color:"#555",display:"flex",alignItems:"center",gap:6}},
+              h("span",{style:{width:5,height:5,borderRadius:"50%",background:"#4fc3f7",display:"inline-block",flexShrink:0}}), f.label))
+          )
+        )
+      ),
+
+      // STEP 2
+      step===2 && h("div", { className:"fade-in", style: { display:"grid", gridTemplateColumns:"1fr 1fr", gap:22 } },
+        h("div", null,
+          h("div", { style: { background:"#fff", border:"1px solid #e0e0e0", borderRadius:10, overflow:"hidden" } },
+            h("div", { style: { background:"#1a1a2e", color:"#fff", padding:"13px 18px", display:"flex", alignItems:"center", gap:10 } },
+              h("div", { style: { fontSize:10, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"#90caf9" } }, "Source of Truth"),
+              h("div", { style: { marginLeft:"auto", fontSize:10, color:"#4fc3f7", fontFamily:"monospace" } }, fileName)
+            ),
+            h("div", { style: { padding:"4px 0" } },
+              ...QA_FIELDS.map(({key,label})=>h("div",{key,style:{display:"flex",padding:"10px 18px",borderBottom:"1px solid #f5f5f5",alignItems:"flex-start",gap:10}},
+                h("div",{style:{fontSize:11,color:"#888",minWidth:120,paddingTop:2,flexShrink:0}},label),
+                h("div",{style:{fontSize:12,fontFamily:"monospace",fontWeight:500,color:briefData?.[key]?"#1a1a2e":"#ccc",wordBreak:"break-word"}},briefData?.[key]||"—")
+              ))
+            )
+          ),
+          h("div", { style: { marginTop:8, fontSize:11, color:"#bbb", textAlign:"center" } }, "Values extracted from brief · Read-only")
+        ),
+        h("div", null,
+          h("div", { style: { background:"#fff", border:"1px solid #e0e0e0", borderRadius:10, overflow:"hidden" } },
+            h("div", { style: { background:"#16213e", color:"#fff", padding:"13px 18px" } },
+              h("div", { style: { fontSize:10, fontWeight:700, letterSpacing:"0.1em", textTransform:"uppercase", color:"#90caf9" } }, "Simulated Ad Platform"),
+              h("div", { style: { fontSize:11, color:"#667", marginTop:2 } }, "Enter values as they appear in the platform")
+            ),
+            h("div", { style: { padding:"16px 18px", display:"flex", flexDirection:"column", gap:12 } },
+              ...QA_FIELDS.map(({key,label,type,options,placeholder})=>h("div",{key},
+                h("label",{style:{fontSize:10,fontWeight:700,letterSpacing:"0.06em",textTransform:"uppercase",color:"#888",display:"block",marginBottom:4}},label),
+                type==="select"
+                  ? h("select",{value:formValues[key]||"",onChange:e=>setFormValues(p=>({...p,[key]:e.target.value})),style:{width:"100%",padding:"7px 9px",borderRadius:6,border:"1.5px solid #e0e0e0",fontSize:12,fontFamily:"monospace",background:"#fafafa",color:"#1a1a2e"}},
+                      ...(options||[]).map(o=>h("option",{key:o,value:o},o||"Select…")))
+                  : h("input",{type:"text",value:formValues[key]||"",placeholder:placeholder||briefData?.[key]||"",onChange:e=>setFormValues(p=>({...p,[key]:e.target.value})),style:{width:"100%",padding:"7px 9px",borderRadius:6,border:"1.5px solid #e0e0e0",fontSize:12,fontFamily:"monospace",background:"#fafafa",color:"#1a1a2e"}})
+              )),
+              h("div", { style: { display:"flex", gap:10, marginTop:6 } },
+                h("button",{onClick:()=>{const pf={};QA_FIELDS.forEach(({key})=>{pf[key]=briefData?.[key]||"";});setFormValues(pf);},style:{flex:1,padding:"9px 0",border:"1.5px solid #c5cae9",borderRadius:7,background:"#fff",fontSize:12,fontWeight:600,color:"#3f51b5"}},"Auto-fill from Brief"),
+                h("button",{onClick:runQA,style:{flex:2,padding:"9px 0",border:"none",borderRadius:7,background:"#1a1a2e",color:"#4fc3f7",fontSize:13,fontWeight:700,letterSpacing:"0.04em"}},"▶ Run QA Check")
+              )
+            )
+          )
+        )
+      ),
+
+      // STEP 3
+      step===3 && qaRun && h("div", { className:"fade-in" },
+        h("div", { style: { display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:20 } },
+          ...[
+            {label:"QA Score",value:`${score}%`,sub:`${passCount}/${total} passed`,color:scoreColor},
+            {label:"Passed",value:passCount,sub:"fields verified",color:"#43a047"},
+            {label:"Failed",value:failCount,sub:"fields mismatched",color:"#e53935"},
+            {label:"Needs Review",value:reviewCount,sub:"manually flagged",color:"#ffa000"},
+          ].map(({label,value,sub,color})=>h("div",{key:label,style:{background:"#fff",border:"1px solid #e0e0e0",borderRadius:10,padding:"14px 18px"}},
+            h("div",{style:{fontSize:10,fontWeight:700,letterSpacing:"0.08em",textTransform:"uppercase",color:"#aaa",marginBottom:6}},label),
+            h("div",{style:{fontSize:26,fontWeight:700,color,fontFamily:"monospace",lineHeight:1}},value),
+            h("div",{style:{fontSize:11,color:"#bbb",marginTop:4}},sub)
+          ))
+        ),
+        h("div", { style: { background:"#fff", border:"1px solid #e0e0e0", borderRadius:10, padding:"14px 18px", marginBottom:20 } },
+          h("div",{style:{display:"flex",justifyContent:"space-between",fontSize:12,color:"#888",marginBottom:7}},h("span",null,"QA Completion"),h("span",{style:{fontFamily:"monospace",fontWeight:600}},`${score}%`)),
+          h("div",{style:{height:8,background:"#f0f0f0",borderRadius:4,overflow:"hidden"}},h("div",{style:{height:"100%",width:`${score}%`,background:scoreColor,borderRadius:4,transition:"width 0.5s"}})),
+          h("div",{style:{display:"flex",gap:16,marginTop:10,fontSize:11}},
+            ...[["#43a047","Pass"],["#e53935","Fail"],["#ffa000","Review"],["#9e9e9e","Pending"]].map(([c,l])=>h("div",{key:l,style:{display:"flex",alignItems:"center",gap:5}},h("div",{style:{width:7,height:7,borderRadius:"50%",background:c}}),h("span",{style:{color:"#888"}},l)))
+          )
+        ),
+
+        failCount>0 && h("div",{style:{marginBottom:16}}, h(DiffLegend)),
+
+        h("div", { style: { background:"#fff", border:"1px solid #e0e0e0", borderRadius:10, overflow:"hidden" } },
+          h("div", { style: { background:"#1a1a2e", color:"#fff", padding:"13px 18px", display:"flex", alignItems:"center", gap:10 } },
+            h("div",{style:{fontSize:10,fontWeight:700,letterSpacing:"0.1em",textTransform:"uppercase",color:"#90caf9"}},"QA Checklist"),
+            failCount>0 && h("div",{style:{fontSize:10,color:"#ffab91",background:"rgba(229,57,53,0.18)",border:"1px solid rgba(229,57,53,0.35)",borderRadius:10,padding:"2px 10px",marginLeft:8}},`${failCount} mismatch${failCount>1?"es":""} · diff active`),
+            h("div",{style:{marginLeft:"auto",display:"flex",gap:8}},
+              h("button",{onClick:()=>{setStep(2);setQaRun(false);},style:{padding:"5px 12px",border:"1px solid #444",borderRadius:5,background:"transparent",color:"#ccc",fontSize:11}},"← Edit"),
+              h("button",{onClick:reset,style:{padding:"5px 12px",border:"1px solid #4fc3f7",borderRadius:5,background:"transparent",color:"#4fc3f7",fontSize:11}},"New Brief")
+            )
+          ),
+          h("div",{style:{display:"grid",gridTemplateColumns:"150px 1fr 1fr 110px 70px",padding:"9px 18px",borderBottom:"1.5px solid #f0f0f0",background:"#fafafa"}},
+            ...["Field","Expected (Brief)","Actual (Platform)","Status","Actions"].map(col=>h("div",{key:col,style:{fontSize:10,fontWeight:700,letterSpacing:"0.09em",textTransform:"uppercase",color:"#bbb"}},col))
+          ),
+
+          ...QA_FIELDS.map(({key,label})=>{
+            const expected=briefData?.[key]??"—", actual=formValues[key]??"";
+            const status=qaResults[key]||"pending", cfg=SC[status];
+            const diff=diffMap[key], isFail=status==="fail"&&diff;
+            return h("div",{key,style:{borderBottom:"1px solid #f5f5f5"}},
+              h("div",{style:{display:"grid",gridTemplateColumns:"150px 1fr 1fr 110px 70px",padding:"13px 18px",alignItems:"start"}},
+                h("div",{style:{fontSize:12,fontWeight:600,color:"#555",paddingTop:2}},label),
+                h("div",{style:{fontSize:11,fontFamily:"monospace",background:isFail?"#fff9f0":"#f9fbe7",border:isFail?"1px solid #ffe0b2":"1px solid transparent",padding:"5px 8px",borderRadius:4,marginRight:8,wordBreak:"break-word",lineHeight:1.7}},
+                  isFail ? h(DiffExpected,{diff}) : h("span",null,expected)
+                ),
+                h("div",{style:{fontSize:11,fontFamily:"monospace",color:actual?"#1a1a2e":"#bbb",background:isFail?"#fff5f5":actual?"#f5fffe":"#fafafa",border:isFail?"1px solid #ef9a9a":"1px solid transparent",padding:"5px 8px",borderRadius:4,marginRight:8,wordBreak:"break-word",lineHeight:1.7}},
+                  isFail ? h(DiffActual,{diff}) : h("span",null,actual||"—")
+                ),
+                h("div",null,h("div",{style:{display:"inline-flex",alignItems:"center",gap:5,padding:"4px 9px",borderRadius:20,border:`1px solid ${cfg.border}`,background:cfg.bg}},
+                  h("div",{style:{width:6,height:6,borderRadius:"50%",background:cfg.dot}}),
+                  h("span",{style:{fontSize:10,fontWeight:700,color:cfg.color,fontFamily:"monospace",letterSpacing:"0.06em"}},cfg.label)
+                )),
+                h("button",{onClick:()=>toggleStatus(key),title:"Cycle: Pass → Fail → Review",style:{padding:"4px 8px",border:"1px solid #e0e0e0",borderRadius:4,background:"#fff",fontSize:11,color:"#555"}},"⟳")
+              ),
+              h("div",{style:{padding:"0 18px 11px 168px"}},
+                h("input",{type:"text",placeholder:"Add QA comment…",value:comments[key]||"",onChange:e=>setComments(p=>({...p,[key]:e.target.value})),style:{width:"100%",padding:"5px 9px",border:"1px solid #eee",borderRadius:4,fontSize:11,color:"#555",background:"#fafafa"}})
+              )
+            );
+          }),
+
+          h("div",{style:{padding:"14px 18px",background:"#fafafa",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}},
+            h("div",{style:{fontSize:12,color:"#888"}},
+              failCount>0 && h("span",{style:{color:"#e53935",fontWeight:600}},`⚠ ${failCount} field${failCount>1?"s":""} need correction · `),
+              reviewCount>0 && h("span",{style:{color:"#ffa000",fontWeight:600}},`${reviewCount} flagged for review · `),
+              passCount===total && h("span",{style:{color:"#43a047",fontWeight:600}},"✓ All fields verified · "),
+              "QA complete"
+            ),
+            h("button",{onClick:exportReport,style:{marginLeft:"auto",padding:"8px 16px",border:"none",borderRadius:6,background:"#1a1a2e",color:"#fff",fontSize:12,fontWeight:600}},"Export QA Report")
+          )
+        )
+      )
+    ),
+    h("div",{style:{textAlign:"center",padding:"20px",fontSize:11,color:"#ccc",borderTop:"1px solid #e8e8e8",marginTop:32,background:"#fff"}},"AdOps QA Assistant · MVP · Campaign Brief Verification Tool")
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
+</body>
+</html>
